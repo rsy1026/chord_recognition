@@ -1,1 +1,10 @@
-BTC_model/
+choco/
+
+.DS_Store
+__pycache__
+
+*.wav
+*.txt
+*.mid
+*.csv
+*.lab
