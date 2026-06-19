@@ -1,7 +1,5 @@
 import librosa
 import numpy as np
-import torch
-import torchcrepe
 
 from pathlib import Path
 from scipy.signal import butter, filtfilt
@@ -9,15 +7,11 @@ from scipy.stats import mode
 
 from madmom.features.beats import RNNBeatProcessor, DBNBeatTrackingProcessor
 
-from chord.constants import IDX_TO_PITCH_CLASS
-from chord.hpcp import generate_hpcp_template_matrix
-
 
 class FeatureExtractor:
     def __init__(self, sr: int = 22050, hop_len: int = 512):
         self.sr = sr
         self.hop_len = hop_len
-        self.template, self.template_key = generate_hpcp_template_matrix()
 
     def execute(self, audio_path: str | Path):
         print("📊 오디오 특징(Chroma & Beat) 분석 중...")
@@ -26,9 +20,9 @@ class FeatureExtractor:
         beats = self.extract_beat(audio_path, sample_size=len(y))
         y_harmonic, _ = librosa.effects.hpss(y, margin=2.0)
         bass_pitch, grid_times = self.extract_bass(y_harmonic, beats)
-        chroma = self.extract_chroma(y_harmonic, grid_times)
+        chroma = self.extract_chroma(y_harmonic, bass_pitch, grid_times)
 
-        return beats, bass_pitch, chroma
+        return grid_times, bass_pitch, chroma
 
     def extract_beat(self, audio_path: str | Path, sample_size: int) -> list:
         """
@@ -50,13 +44,16 @@ class FeatureExtractor:
 
         return bass_pitch, grid_times
 
-    def extract_chroma(self, y_harmonic: np.ndarray, grid_times: list) -> np.ndarray:
+    def extract_chroma(
+        self, y_harmonic: np.ndarray, bass_pitch: np.ndarray, grid_times: list
+    ) -> np.ndarray:
         """
         2. 오디오를 로드하고 크로마(Chroma) 특징 추출
         """
         chroma = self.extract_grid_synchronous_chroma(
             y_harmonic, grid_times, sr=self.sr, hop_length=self.hop_len
         )
+        chroma = self.suppress_bass_harmonics_on_chroma(chroma, bass_pitch)
 
         return chroma
 
@@ -88,7 +85,7 @@ class FeatureExtractor:
 
     @staticmethod
     def extract_beat_synchronous_bass(
-        y_bass_only, beat_times, sr, hop_length=512, subdivision=2
+        y_bass_only, beat_times, sr, hop_length=512, subdivision=1
     ):
         """
         1. 비트를 16분음표(subdivision=4) 단위의 그리드로 쪼갭니다.
@@ -232,6 +229,65 @@ class FeatureExtractor:
         chroma_pooled = librosa.util.normalize(chroma_pooled, norm=2, axis=0)
 
         return chroma_pooled
+
+    @staticmethod
+    def suppress_bass_harmonics_on_chroma(
+        chroma_pooled, pooled_midi, alpha_3rd=0.15, alpha_5th=0.25
+    ):
+        """
+        추적된 베이스(f0)의 주파수를 기반으로 크로마그램 내의
+        3배음(완전5도) 및 5배음(장3도) 고스트 에너지를 적응적으로 차감합니다.
+
+        Args:
+            chroma_pooled: (12, M) 차원의 전처리 및 풀링 완료된 크로마 행렬
+            pooled_midi: (M,) 차원의 타임스탬프별 정수형 베이스 피치 배열 (NaN 포함)
+            alpha_3rd: 3배음(완전5도, +7 semitones) 억제 계수 (0.0 ~ 1.0)
+            alpha_5th: 5배음(장3도, +4 semitones) 억제 계수 (0.0 ~ 1.0) -> Cmin7 방어용 핵심 인자
+
+        Returns:
+            chroma_cleaned: 배음 오염이 정제되고 재정규화된 (12, M) 크로마 행렬
+        """
+        M = chroma_pooled.shape[1]
+        chroma_cleaned = chroma_pooled.copy()
+
+        for t in range(M):
+            bass_midi = pooled_midi[t]
+
+            # 베이스 트래커가 음고를 잡아내지 못한 묵음 구간은 스킵
+            if np.isnan(bass_midi):
+                continue
+
+            # 절대 MIDI 번호를 12반음 클래스(0~11)로 매핑
+            bass_class = int(bass_midi % 12)
+
+            # 중고음역대(C3 이상) 크로마그램에 남아있는 베이스 성분의 현재 에너지 확인
+            # fmin=C3 격리를 거쳤어도 베이스의 상위 옥타브(C3, C4 등) 에너지가 이 칸에 잔존함
+            bass_energy = chroma_pooled[bass_class, t]
+
+            if bass_energy > 0.0:
+                # --------------------------------------------------------
+                # 1. 5배음(장3도, +4 semitones) 고스트 저격
+                # Cmin7 구간에서 Eflat을 누르고 튀어 올라오던 유령 E 에너지를 제거하는 핵심 룰
+                # --------------------------------------------------------
+                ghost_major_3rd = (bass_class + 4) % 12
+                chroma_cleaned[ghost_major_3rd, t] -= alpha_5th * bass_energy
+
+                # --------------------------------------------------------
+                # 2. 3배음(완전5도, +7 semitones) 고스트 저격
+                # 근음이 뿜어내는 강력한 5도 배음(G)을 제거하여 화성적 명료도 확보
+                # --------------------------------------------------------
+                ghost_perfect_5th = (bass_class + 7) % 12
+                chroma_cleaned[ghost_perfect_5th, t] -= alpha_3rd * bass_energy
+
+        # --------------------------------------------------------
+        # 후처리: 차감 연산으로 인해 발생한 음수(-) 값을 0으로 클리핑 방어
+        # --------------------------------------------------------
+        chroma_cleaned = np.clip(chroma_cleaned, a_min=0.0, a_max=1.0)
+
+        # 배음 에너지가 빠져나간 자리를 메우고, 비터비 관측 점수 스케일을 유지하기 위해 재정규화(L2)
+        chroma_cleaned = librosa.util.normalize(chroma_cleaned, norm=2, axis=0)
+
+        return chroma_cleaned
 
 
 class BeatTrackerPipeline:
