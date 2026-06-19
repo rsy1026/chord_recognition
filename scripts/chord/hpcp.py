@@ -1,63 +1,59 @@
 import numpy as np
 
-from chord.constants import IDX_TO_PITCH_CLASS
+from chord.constants import QUALITY_INTERVALS, QUALITY_TO_IDX
 
 
-def generate_hpcp_template_matrix() -> tuple:
+def generate_hpcp_chord_templates():
     """
-    12개의 루트와 7개의 퀄리티, 1개의 No Chord를 포함하는
-    85 x 12 크기의 배음 템플릿 행렬을 생성합니다.
+    1152개 상태 각각에 대해 음향학적 배음 구조(Harmonics)를 반영한
+    12차원 HPCP 기반 크로마 템플릿을 생성합니다.
     """
-    # 7가지 타겟 퀄리티의 반음 간격(Interval) 정의
-    quality_intervals = {
-        "major": [0, 4, 7],
-        "minor": [0, 3, 7],
-        "major-seventh": [0, 4, 7, 11],
-        "minor-seventh": [0, 3, 7, 10],
-        "dominant-seventh": [0, 4, 7, 10],
-        "diminished": [0, 3, 6],
-        "half-diminished": [0, 3, 6, 10],
-        "augmented": [0, 4, 8],
+    # 8개 퀄리티별 순수 구성음 간격
+    base_intervals = {QUALITY_TO_IDX[k]: v for k, v in QUALITY_INTERVALS.items()}
+
+    # 배음 모델링 가중치 (f, 2f, 3f, 4f, 5f)
+    # 기본음 정보 외에 5도(7)와 3도(4) 대역으로 에너지가 자연스럽게 흐르도록 유도
+    harmonic_weights = {
+        0: 1.0,  # 기본음 (Root)
+        7: 0.33,  # 3배음 (완전5도 성분)
+        4: 0.20,  # 5배음 (장3도 성분)
     }
+    minor_idxs = [
+        QUALITY_TO_IDX[q]
+        for q in ["minor", "diminished", "minor-seventh", "half-diminished"]
+    ]
 
-    # 자연 배음렬 가중치 (1배음: 1.0, 3배음(+7반음): 0.33, 5배음(+4반음): 0.2)
-    # 옥타브 배음은 크로마에서 같은 피치 클래스로 합산되므로 생략하거나 미세 조정 가능
-    overtone_weights = {
-        0: 1.0,  # 자기 자신 (Fundamental)
-        7: 0.33,  # 완전 5도 (Perfect 5th)
-        4: 0.20,  # 장 3도 (Major 3rd)
-    }
+    templates = np.zeros((1152, 12))
 
-    templates = []
-    template_keys = []
+    for state_idx in range(1152):
+        qual_idx = (state_idx // 12) % 8
+        root_idx = state_idx // 96
 
-    # 1. 12개 루트 x 7개 퀄리티 = 84개 화음 템플릿 생성
-    for root in range(12):
-        for q_name, intervals in quality_intervals.items():
-            chroma_vector = np.zeros(12)
+        # 1. 해당 화음의 순수 구성음들을 먼저 배치
+        chord_notes = [
+            (root_idx + interval) % 12 for interval in base_intervals[qual_idx]
+        ]
 
-            # 각 코드톤에 대해 배음 가중치 누적
-            for interval in intervals:
-                chord_tone = (root + interval) % 12
+        # 2. 각 구성음이 발생시키는 배음 에너지를 템플릿 12개 칸에 누적 주입
+        for note in chord_notes:
+            for h_interval, weight in harmonic_weights.items():
+                h_note = (note + h_interval) % 12
+                templates[state_idx, h_note] += weight
 
-                for overtone_interval, weight in overtone_weights.items():
-                    harmonic_pitch = (chord_tone + overtone_interval) % 12
-                    chroma_vector[harmonic_pitch] += weight
+        # 2. [핵심 오답 저격] 마이너 계열 화음(min, min7, hdim, dim -> 1, 5, 7, 2)에
+        # 메이저 3도(Root + 4)가 들어오면 내적 점수를 깎아버리는 역가중치(Penalty) 주입
+        if qual_idx in minor_idxs:  # 마이너 속성들
+            major_3rd_note = (root_idx + 4) % 12
+            # 마이너 화음인데 오디오에 메이저 3도(E) 에너지가 존재한다면 점수를 강제로 차감
+            templates[state_idx, major_3rd_note] -= 0.4
 
-            # L2 정규화 (코사인 유사도 계산을 위해 벡터 길이를 1로 맞춤)
-            norm = np.linalg.norm(chroma_vector)
-            if norm > 0:
-                chroma_vector = chroma_vector / norm
+            # 마이너 정체성인 단3도(Root + 3) 에너지 요구치 강화
+            minor_3rd_note = (root_idx + 3) % 12
+            templates[state_idx, minor_3rd_note] *= 1.3
 
-            templates.append(chroma_vector)
-            template_keys.append("_".join([IDX_TO_PITCH_CLASS[root], q_name]))
+    # 3. 크로마그램 데이터(L2 Norm 정규화 처리됨)와
+    # 내적(Dot Product) 연산 시 정확한 스케일을 맞추기 위해 템플릿도 행 단위 정규화
+    norms = np.linalg.norm(templates, axis=1, keepdims=True)
+    hpcp_templates = templates / np.where(norms == 0, 1.0, norms)
 
-    # 2. No Chord (NC) 템플릿 추가 (모든 음이 평탄하거나 에너지가 없는 상태)
-    nc_vector = np.ones(12) / np.sqrt(12)  # 평탄한 분포의 L2 정규화
-    templates.append(nc_vector)
-    template_keys.append("NC")
-
-    # 최종 행렬 변환: (85, 12) 차원
-    template_matrix = np.array(templates)
-
-    return template_matrix, template_keys
+    return hpcp_templates
