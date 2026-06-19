@@ -37,8 +37,7 @@ class ChordRecognizer:
         M = chroma_cleaned.shape[1]
 
         # 1. 템플릿 매칭 및 관측 확률 초기화 (음정 판별식 템플릿 가정)
-        templates = generate_hpcp_chord_templates()
-        raw_similarity = np.dot(templates, chroma_cleaned)
+        raw_similarity = np.dot(self.templates, chroma_cleaned)
         log_E = gamma * raw_similarity
 
         # 2. 3차원 추적 텐서 초기화
@@ -109,41 +108,53 @@ class ChordRecognizer:
             T3[:, t, :] = top_k_indices % K
             # =====================================================================
 
-        # 4. 역추적 (Backtracking)
-        best_sequences = np.zeros((K, M), dtype=np.int32)
-
-        # 마지막 타임스탬프에서 글로벌 1~K위의 도착점 찾기
+        # 4. 다양성이 보장된 역추적 (Diversity-Aware Backtracking)
+        # 단순히 3개를 뽑지 않고, 여유 있게 상위 30개의 도착점을 추출하여 검사합니다.
+        search_pool_size = min(30, K * 10)
         final_scores_flat = T1[:, M - 1, :].flatten()
-        global_top_k_indices = np.argsort(final_scores_flat)[-K:][::-1]
 
-        curr_states = global_top_k_indices // K
-        curr_ks = global_top_k_indices % K
+        # 상위 30개의 인덱스를 점수 내림차순으로 정렬
+        pool_indices = np.argsort(final_scores_flat)[-search_pool_size:][::-1]
 
-        # 시작점 기록
-        for rank in range(K):
-            best_sequences[rank, M - 1] = curr_states[rank]
+        curr_states_pool = pool_indices // K
+        curr_ks_pool = pool_indices % K
 
-        # 과거로 거슬러 올라가며 K개의 실타래를 동시에 풀어냄
-        for t in range(M - 2, -1, -1):
-            next_states = np.zeros(K, dtype=np.int32)
-            next_ks = np.zeros(K, dtype=np.int32)
+        best_sequences = []
+        # 중복 검사를 위해 각 시퀀스의 '순수 화성(Root+Quality) 궤적'을 문자열로 해싱하여 저장
+        seen_harmonic_trajectories = set()
 
-            for rank in range(K):
-                s = curr_states[rank]
-                k = curr_ks[rank]
+        for i in range(search_pool_size):
+            s = curr_states_pool[i]
+            k = curr_ks_pool[i]
 
-                # 포인터가 가리키는 이전 프레임의 정보 호출
-                prev_s = T2[s, t + 1, k]
-                prev_k = T3[s, t + 1, k]
+            path = np.zeros(M, dtype=np.int32)
+            path[M - 1] = s
 
-                best_sequences[rank, t] = prev_s
-                next_states[rank] = prev_s
-                next_ks[rank] = prev_k
+            curr_s = s
+            curr_k = k
 
-            curr_states = next_states
-            curr_ks = next_ks
+            # 단일 경로 역추적
+            for t in range(M - 2, -1, -1):
+                prev_s = T2[curr_s, t + 1, curr_k]
+                prev_k = T3[curr_s, t + 1, curr_k]
+                path[t] = prev_s
+                curr_s = prev_s
+                curr_k = prev_k
 
-        return best_sequences
+            # --- [중복 검사 로직] ---
+            # 추출된 path에서 베이스를 버리고 Root(12) * Quality(8) = 96차원의 궤적만 추출
+            harmonic_trajectory = tuple((state // 12) for state in path)
+
+            # 완전히 똑같은 화성 진행(베이스만 다른 경우)은 과감하게 폐기
+            if harmonic_trajectory not in seen_harmonic_trajectories:
+                seen_harmonic_trajectories.add(harmonic_trajectory)
+                best_sequences.append(path)
+
+            # 진정으로 다른 궤적을 가진 K(3)개의 시퀀스가 모이면 루프 즉시 종료
+            if len(best_sequences) == K:
+                break
+
+        return np.array(best_sequences)
 
     @staticmethod
     def decode_candidates(candidates: np.ndarray):
