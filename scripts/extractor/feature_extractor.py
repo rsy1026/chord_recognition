@@ -37,7 +37,10 @@ class FeatureExtractor:
         return beats_t
 
     def extract_bass(self, y_harmonic: np.ndarray, beats: list) -> tuple:
-        y_filtered = self.apply_lowpass_filter(y_harmonic, sr=self.sr)
+        fmin = librosa.note_to_hz("C3")
+        y_filtered = self.apply_lowpass_filter(
+            y_harmonic, sr=self.sr, cutoff_freq=int(fmin)
+        )
         bass_pitch, grid_times = self.extract_beat_synchronous_bass(
             y_filtered, beats, sr=self.sr, hop_length=self.hop_len
         )
@@ -53,7 +56,7 @@ class FeatureExtractor:
         chroma = self.extract_grid_synchronous_chroma(
             y_harmonic, grid_times, sr=self.sr, hop_length=self.hop_len
         )
-        chroma = self.suppress_bass_harmonics_on_chroma(chroma, bass_pitch)
+        # chroma = self.suppress_bass_harmonics_on_chroma(chroma, bass_pitch)
 
         return chroma
 
@@ -85,7 +88,7 @@ class FeatureExtractor:
 
     @staticmethod
     def extract_beat_synchronous_bass(
-        y_bass_only, beat_times, sr, hop_length=512, subdivision=1
+        y_bass_only, beat_times, sr, hop_length=512, subdivision=2
     ):
         """
         1. 비트를 16분음표(subdivision=4) 단위의 그리드로 쪼갭니다.
